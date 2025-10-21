@@ -1,0 +1,1132 @@
+#required installs for the project to function properly
+!pip install sgp4
+!pip install numpy
+!pip install tensorflow
+
+
+
+#list of imports used in this project
+import json
+import numpy as np
+import os
+import glob
+import tensorflow as tf
+from collections import Counter
+from datetime import datetime, timedelta
+from collections import defaultdict
+import re
+import math
+from sgp4.api import Satrec, WGS72
+from datetime import datetime, timedelta
+from typing import List, Dict, Tuple
+from sklearn.model_selection import KFold, train_test_split
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from tensorflow.keras import layers, models
+
+
+
+# ---- Time helpers ---- -> This lets us turn the compact TLE time format into a readable calendar date & time.
+def tle_epoch_to_datetime(epoch: float) -> datetime:
+    year = int(epoch // 1000)
+    day_of_year = epoch % 1000
+    year += 2000 if year < 57 else 1900
+    int_day = int(day_of_year)
+    fractional_day = day_of_year - int_day
+    base = datetime(year, 1, 1) + timedelta(days=int_day - 1)
+    return base + timedelta(days=fractional_day)
+
+
+# Extracts the epoch value from the first line of a TLE (line 1), thehn grabs the 2-digit year (column 19–20) to convert to 19xx or 20xx.
+def extract_epoch_from_line1(line1: str) -> float:
+    year = int(line1[18:20])
+    year += 2000 if year < 57 else 1900
+    day = float(line1[20:32])
+    return (year % 1000) * 1000 + day
+
+
+# Reads the BSTAR drag term from the first line of a TLE
+#   (e.g. " 34123-4" means 0.34123 × 10⁻⁴).
+# - This function slices out that substring, parses it with regex thenconverts it into a normal floating-point number.
+def parse_bstar(line1: str) -> float:
+    raw = line1[53:61].strip()
+    bstar = 0.0
+    try:
+        m = re.fullmatch(r"([ +-]?\d{5})([-+]\d)", raw)
+        if m:
+            base, exp = m.groups()
+            bstar = float(f"{base[0]}.{base[1:]}e{exp}")
+        else:
+            raw_clean = raw.replace('+','').replace('-','')
+            digits = re.sub(r"[^\d]", "", raw_clean)
+            if digits:
+                bstar = float(f"0.{digits}")
+    except Exception:
+        pass
+    return bstar
+
+# Extract the satellite catalog number from the first line of a TLE.
+# - If found return the integer satellite number.
+def parse_satnum(line1: str) -> int:
+    m = re.match(r'^1\s*0*(\d{1,5})', line1.strip())
+    if m:
+        return int(m.group(1))
+    digits = re.sub(r'\D', '', line1[2:7])
+    return int(digits) if digits else -1
+
+
+# Reads the TLE file and organizes data by satellite number
+# Returns satnum: [list of TLE entries in time order
+
+def parse_tle_file_grouped(path: str) -> Dict[int, List[dict]]:
+    with open(path, "r") as f:
+        lines = [ln.strip() for ln in f if ln.strip()]
+    entries = []
+    for i in range(0, len(lines) - 1, 2):
+        line1, line2 = lines[i], lines[i+1]
+        try:
+            epoch = extract_epoch_from_line1(line1)
+            satnum = parse_satnum(line1)
+            entries.append({"line1": line1, "line2": line2, "epoch": epoch, "satnum": satnum})
+        except Exception:
+            continue
+    groups: Dict[int, List[dict]] = {}
+    for e in entries:
+        if e["satnum"] < 0: continue
+        groups.setdefault(e["satnum"], []).append(e)
+    for s in groups:
+        groups[s].sort(key=lambda d: d["epoch"])
+    return groups
+
+
+# Converts a Python datetime into the Julian day (jd) and fractional day (fr).
+def _jday(dt: datetime) -> Tuple[float, float]:
+    jd = 367*dt.year - (7*(dt.year + (dt.month + 9)//12))//4 + (275*dt.month)//9 + dt.day + 1721013.5
+    fr = (dt.hour + dt.minute/60 + dt.second/3600 + dt.microsecond/3.6e9)/24.0
+    return jd, fr
+
+
+
+# Propagate TLE to a given datetime using SGP4.
+def propagate_tle_pos_vel(line1: str, line2: str, dt: datetime) -> Tuple[np.ndarray, np.ndarray]:
+    sat = Satrec.twoline2rv(line1, line2, WGS72)
+    jd, fr = _jday(dt)
+    err, r, v = sat.sgp4(jd, fr)
+    if err != 0:
+        raise RuntimeError(f"SGP4 error code {err}")
+    return np.array(r, dtype=float), np.array(v, dtype=float)  # km, km/s (ECI-like TEME)
+
+
+
+# Transforms a vector from ECI to the local RSW frame at (r_eci, v_eci).
+def eci_to_rsw(r_eci: np.ndarray, v_eci: np.ndarray, vec_eci: np.ndarray) -> np.ndarray:
+    r = r_eci; v = v_eci
+    r_hat = r / np.linalg.norm(r)
+    h = np.cross(r, v)
+    w_hat = h / np.linalg.norm(h)
+    s_hat = np.cross(w_hat, r_hat)
+    return np.array([np.dot(r_hat, vec_eci), np.dot(s_hat, vec_eci), np.dot(w_hat, vec_eci)], dtype=float)
+
+
+# Finds the index of the first TLE in a sequence whose epoch time is >= target
+
+def _nearest_future_tle(seq: List[dict], target: datetime, start_j: int) -> int:
+    for j in range(start_j, len(seq)):
+        t_j = tle_epoch_to_datetime(seq[j]["epoch"])
+        if t_j >= target:
+            return j
+    return -1
+
+
+def build_sequence_dataset_same_sat(
+        input_path: str,
+        horizons_hr: List[int] = list(range(0, 337, 24)),  # 0,24,...,336 (15 steps)
+        unit: str = "km"
+    ):
+    """
+    For each satellite, for each base TLE_i, build a sequence over horizons H.
+    X[n,t,:] = engineered features at horizon t (Δt, r0, bstar, r_pred)
+    Y[n,t,:] = error in RSW at that horizon: (r_pred - r_true) in RSW(r_pred,v_pred)
+    mask[n,t] = 1 if compute truth at that horizon, else 0
+    """
+    groups = parse_tle_file_grouped(input_path)
+    all_X, all_Y, all_M, all_sat, all_t0days = [], [], [], [], []
+
+    for satnum, seq in groups.items():
+        if len(seq) < 2:  # need at least two TLEs
+            continue
+
+        # reference start time for temporal split
+        t0 = tle_epoch_to_datetime(seq[0]["epoch"])
+
+        # iterate base indices
+        for i in range(0, len(seq)-1):
+            base = seq[i]
+            t_base = tle_epoch_to_datetime(base["epoch"])
+
+            # r0, v0 at base
+            try:
+                r0, v0 = propagate_tle_pos_vel(base["line1"], base["line2"], t_base)
+            except Exception:
+                continue
+
+            bstar = parse_bstar(base["line1"])
+
+            # roll forward across horizons
+            X_row, Y_row, M_row = [], [], []
+            j_ptr = i+1  # search future TLEs
+            ok_any = False
+
+            for H in horizons_hr:
+                t_target = t_base + timedelta(hours=H)
+
+                # Predict with base TLE at target
+                try:
+                    r_pred, v_pred = propagate_tle_pos_vel(base["line1"], base["line2"], t_target)
+                except Exception:
+                    X_row.append([float(H)] + [np.nan]*3 + [float(bstar)] + [np.nan]*3)
+                    Y_row.append([np.nan, np.nan, np.nan]); M_row.append(0); continue
+
+                # Find a future TLE to act as "truth", propagate it to t_target
+                j_ptr = max(j_ptr, i+1)
+                idx_truth = _nearest_future_tle(seq, t_target, j_ptr)
+                if idx_truth < 0:
+                    # no future TLE to serve truth
+                    X_row.append([float(H)] + list(r0) + [float(bstar)] + list(r_pred))
+                    Y_row.append([np.nan, np.nan, np.nan]); M_row.append(0); continue
+
+                j_ptr = idx_truth
+                fut = seq[idx_truth]
+                try:
+                    r_true, v_true = propagate_tle_pos_vel(fut["line1"], fut["line2"], t_target)
+                except Exception:
+                    X_row.append([float(H)] + list(r0) + [float(bstar)] + list(r_pred))
+                    Y_row.append([np.nan, np.nan, np.nan]); M_row.append(0); continue
+
+                # error in ECI then express in RSW
+                dr_eci = r_pred - r_true
+                e_rsw = eci_to_rsw(r_pred, v_pred, dr_eci)  # km
+
+                if unit.lower().startswith("m"):
+                    e_rsw = e_rsw * 1000.0
+
+                # features: [Δt_hr, r0(3), b*, r_pred(3)]  => 1D-CNN over t
+                X_row.append([float(H)] + list(r0) + [float(bstar)] + list(r_pred))
+                Y_row.append(list(map(float, e_rsw)))
+                M_row.append(1); ok_any = True
+
+            if not ok_any:
+                continue
+
+            X_row = np.array(X_row, dtype=float)   # (T, Cx)
+            Y_row = np.array(Y_row, dtype=float)   # (T, 3)
+            M_row = np.array(M_row, dtype=np.int32)  # (T,)
+
+            # replace any lingering NaNs in X at masked steps (won't be used anyway)
+            nan_t = ~np.isfinite(X_row).any(axis=1)
+            M_row[nan_t] = 0
+            X_row[~np.isfinite(X_row)] = 0.0
+
+            all_X.append(X_row)
+            all_Y.append(Y_row)
+            all_M.append(M_row)
+            all_sat.append(satnum)
+            all_t0days.append((t_base - t0).total_seconds()/86400.0)  # days from first TLE
+
+    X = np.stack(all_X, axis=0) if all_X else np.zeros((0, len(horizons_hr), 8))
+    Y = np.stack(all_Y, axis=0) if all_Y else np.zeros((0, len(horizons_hr), 3))
+    M = np.stack(all_M, axis=0) if all_M else np.zeros((0, len(horizons_hr)), dtype=np.int32)
+    sat_ids = np.array(all_sat, dtype=np.int32)
+    base_days = np.array(all_t0days, dtype=float)
+
+    return X, Y, M, sat_ids, base_days, horizons_hr
+
+# ---- IQR filter on Y per-step using mask ----
+def iqr_mask_steps(Y: np.ndarray, mask: np.ndarray, whisker=1.5):
+    """
+    Y: (N,T,3), mask: (N,T)
+    Returns a refined mask where steps flagged as outliers are zeroed out.
+    """
+    valid = mask.astype(bool)  # (N,T) - Corrected this line
+
+    if not np.any(valid):
+        return mask.copy(), {"Q1":[0,0,0], "Q3":[0,0,0], "lo":[0,0,0], "hi":[0,0,0]}
+
+    # Flatten the valid data points across N and T, keeping the 3 dimensions of Y
+    vals = Y[valid].reshape(-1, 3)  # (K,3)
+
+    Q1 = np.percentile(vals, 25, axis=0)
+    Q3 = np.percentile(vals, 75, axis=0)
+    IQR = Q3 - Q1
+    lo = Q1 - whisker * IQR
+    hi = Q3 + whisker * IQR
+
+    # Identify which of the valid points are within the IQR range
+    keep = np.all((vals >= lo) & (vals <= hi), axis=1)  # (K,)
+
+    # Create a new mask based on the original valid mask and the keep array
+    refined = valid.copy()
+    # This part needs careful indexing to map 'keep' back to the original (N, T) mask
+    # assign the result back to the corresponding positions in 'refined'.
+    refined[valid] = keep
+
+    refined = refined.astype(np.int32)
+
+    stats = {"Q1": Q1.tolist(), "Q3": Q3.tolist(), "lo": lo.tolist(), "hi": hi.tolist()}
+    return refined, stats
+
+
+# ---- Normalization (train only) ----
+def compute_norm_stats_seq(X_tr: np.ndarray, Y_tr: np.ndarray, M_tr: np.ndarray):
+    # X across all steps (no mask—features are defined even if masked)
+    x_mean = X_tr.reshape(-1, X_tr.shape[-1]).mean(axis=0)
+    x_std  = X_tr.reshape(-1, X_tr.shape[-1]).std(axis=0) + 1e-8
+
+    # Y only over valid steps
+    valid = M_tr.astype(bool)[..., None]
+    if np.any(valid):
+        Yv = Y_tr[valid].reshape(-1, 3)
+        y_mean = Yv.mean(axis=0)
+        y_std  = Yv.std(axis=0) + 1e-8
+    else:
+        y_mean = np.zeros(3); y_std = np.ones(3)
+    return {"x_mean": x_mean, "x_std": x_std, "y_mean": y_mean, "y_std": y_std}
+
+def apply_norm_seq(X: np.ndarray, Y: np.ndarray, stats):
+    Xn = (X - stats["x_mean"][None, None, :]) / stats["x_std"][None, None, :]
+    Yn = (Y - stats["y_mean"][None, None, :]) / stats["y_std"][None, None, :]
+    return Xn, Yn
+
+def metrics_paper_aligned(y_true: np.ndarray, y_pred: np.ndarray):
+    err = y_true - y_pred
+    mse = (err**2).mean(axis=0)
+    rmse = np.sqrt(mse)
+    rms_3d = np.sqrt((err**2).sum(axis=1).mean())
+    return {
+        "MSE_R": float(mse[0]), "MSE_A": float(mse[1]), "MSE_C": float(mse[2]),
+        "RMSE_R": float(rmse[0]), "RMSE_A": float(rmse[1]), "RMSE_C": float(rmse[2]),
+        "RMS_3D": float(rms_3d),
+    }
+
+def horizon_report(deltas_hr: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray,
+                   horizons_hr=tuple(range(0,337,24)), tol=0.5):
+    rep = {}
+    for H in horizons_hr:
+        mask = np.abs(deltas_hr - H) <= tol
+        if not np.any(mask): continue
+        rep[H] = metrics_paper_aligned(y_true[mask], y_pred[mask])
+    return rep
+
+
+
+
+
+
+
+# PART B: BUILD FULL-COVERAGE SEQUENCES (0..14 days, ±3h), NO MASK
+
+
+ARTIFACTS_DIR   = "outputs/artifacts"
+os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+
+TLE_FILE        = "all_tles_fully_covered.txt"   # put the file in your working dir or give full path
+H_DAYS          = list(range(0, 15))             # 0..14 days
+BIN_TOL_HOURS   = 12.0                            # tolerance around each daily horizon
+
+def _is_name_line(s):  # detect 3-line TLE name line
+    return (not s.startswith("1 ")) and (not s.startswith("2 "))
+
+def _parse_satnum(line1):
+    m = re.match(r'^1\s*0*(\d{1,5})', line1.strip())
+    if m: return int(m.group(1))
+    digits = re.sub(r'\D', '', line1[2:7])
+    return int(digits) if digits else -1
+
+def _parse_epoch_from_line1(line1):
+    yr = int(line1[18:20]); yr += 2000 if yr < 57 else 1900
+    day = float(line1[20:32]); return (yr % 1000) * 1000 + day
+
+def _nearest_future_index(times, t0, dt_hours, tol_hours):
+    target = t0 + timedelta(hours=dt_hours)
+    lo, hi = target - timedelta(hours=tol_hours), target + timedelta(hours=tol_hours)
+    best_j, best_dt = None, None
+    for j, tj in enumerate(times):
+        if tj >= t0 and lo <= tj <= hi:
+            dt = abs((tj - target).total_seconds())
+            if best_dt is None or dt < best_dt:
+                best_dt, best_j = dt, j
+    return best_j
+
+# 1) Load & group TLEs by satellite (supports 2- or 3-line format)
+with open(TLE_FILE, "r") as f:
+    raw = [ln.strip() for ln in f if ln.strip()]
+
+groups = {}
+i = 0
+while i < len(raw):
+    if _is_name_line(raw[i]) and i+2 < len(raw) and raw[i+1].startswith("1 ") and raw[i+2].startswith("2 "):
+        line1, line2 = raw[i+1], raw[i+2]; i += 3
+    elif raw[i].startswith("1 ") and i+1 < len(raw) and raw[i+1].startswith("2 "):
+        line1, line2 = raw[i], raw[i+1]; i += 2
+    else:
+        i += 1
+        continue
+    try:
+        epoch = _parse_epoch_from_line1(line1)
+        sat   = _parse_satnum(line1)
+        if sat < 0: continue
+        groups.setdefault(sat, []).append({"line1": line1, "line2": line2, "epoch": epoch})
+    except:
+        pass
+
+for sat in list(groups.keys()):
+    groups[sat].sort(key=lambda e: e["epoch"])
+
+print(f"Satellites found: {len(groups)}")
+
+# 2) Build full-coverage sequences at horizons 0..14 days (±3h)
+X_list, Y_list, H_list, S_ids = [], [], [], []
+per_sat_counts = {}
+
+for sat, seq in groups.items():
+    times = [tle_epoch_to_datetime(e["epoch"]) for e in seq]
+    n_full = 0
+
+    for i0 in range(len(seq)):                       # pick base TLE index (day 0)
+        base = seq[i0]
+        t0   = times[i0]
+
+        # Find matching TLE lines near each daily horizon
+        idxs = []
+        for d in H_DAYS:
+            j = _nearest_future_index(times, t0, d*24.0, BIN_TOL_HOURS)
+            if j is None:
+                idxs = None
+                break
+            idxs.append(j)
+        if idxs is None:
+            continue  # this base does not have a complete 0..14d chain
+
+        # Build features/labels for this full sequence
+        # Features per step (example, mirroring prior patch):
+        #   [Δt_hr, r0_x,r0_y,r0_z, bstar, r_pred_x,r_pred_y,r_pred_z]  => 8 features
+        # Labels per step: RSW error components [R, A, C] in km
+        T = len(H_DAYS)
+        X_seq = np.zeros((T, 8), dtype=float)
+        Y_seq = np.zeros((T, 3), dtype=float)
+        H_seq = np.array(H_DAYS, dtype=float)
+
+        # Base state at t0 from base TLE
+        try:
+            r0, v0 = propagate_tle_pos_vel(base["line1"], base["line2"], t0)
+        except Exception:
+            continue
+        bstar0 = parse_bstar(base["line1"])
+
+        for k, (d, j) in enumerate(zip(H_DAYS, idxs)):
+            future = seq[j]
+            tfut   = times[j]
+            dt_hr  = (tfut - t0).total_seconds()/3600.0
+
+            # Predict at tfut using base TLE_i, and "truth" using TLE_j
+            try:
+                r_pred, v_pred = propagate_tle_pos_vel(base["line1"],   base["line2"],   tfut)
+                r_true, v_true = propagate_tle_pos_vel(future["line1"], future["line2"], tfut)
+            except Exception:
+                X_seq[k, :] = np.nan
+                Y_seq[k, :] = np.nan
+                continue
+
+            # Error in ECI, then expressed in RSW @ (r_pred, v_pred)
+            dr_eci = r_pred - r_true
+            e_rsw  = eci_to_rsw(r_pred, v_pred, dr_eci)  # km
+
+            # Fill features/labels
+            X_seq[k, :] = np.array([dt_hr, *r0.tolist(), bstar0, *r_pred.tolist()], dtype=float)
+            Y_seq[k, :] = e_rsw.astype(float)
+
+        # Skip if any NaNs slipped in (shouldn’t for full coverage)
+        if np.isnan(X_seq).any() or np.isnan(Y_seq).any():
+            continue
+
+        X_list.append(X_seq)
+        Y_list.append(Y_seq)
+        H_list.append(H_seq)
+        S_ids.append(sat)
+        n_full += 1
+
+    per_sat_counts[sat] = n_full
+
+total = len(X_list)
+print("Full 0..14d sequences per satellite (±12h):")
+for sat in sorted(per_sat_counts.keys()):
+    print(f"  {sat}: {per_sat_counts[sat]}")
+print(f"\nTOTAL sequences kept: {total}")
+
+if total == 0:
+    raise RuntimeError("No fully-covered sequences were built. Double-check the TLE file path/format and tolerance.")
+
+# 3) Save arrays for Part C
+X_all  = np.array(X_list, dtype=float)  # (N, 15, 8)
+Y_all  = np.array(Y_list, dtype=float)  # (N, 15, 3)
+H_all  = np.array(H_list, dtype=float)  # (N, 15)
+sat_ids= np.array(S_ids, dtype=int)
+
+np.save(os.path.join(ARTIFACTS_DIR, "X_all.npy"),   X_all)
+np.save(os.path.join(ARTIFACTS_DIR, "Y_all.npy"),   Y_all)
+np.save(os.path.join(ARTIFACTS_DIR, "H_all.npy"),   H_all)
+np.save(os.path.join(ARTIFACTS_DIR, "sat_ids.npy"), sat_ids)
+
+print(" Saved X_all/Y_all/H_all/sat_ids to", ARTIFACTS_DIR)
+print("   Shapes:", X_all.shape, Y_all.shape, H_all.shape, sat_ids.shape)
+
+
+
+
+
+
+
+
+
+
+
+# PART C: TRAINING (1D CNN, NO MASKS, PER-SATELLITE, PER-STEP OUTPUTS)
+
+
+
+ARTIFACTS_DIR = "outputs/artifacts"
+MODELS_DIR    = "outputs/models"
+os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# Shapes:
+#   X_all:   (N, 15, F)   features
+#   Y_all:   (N, 15, 3)   labels in RSW (km) *UNNORMALIZED*
+#   H_all:   (N, 15)      integer horizons in days [0..14]
+#   sat_ids: (N,)         per-sample satellite id
+X_all   = np.load(os.path.join(ARTIFACTS_DIR, "X_all.npy"))
+Y_all   = np.load(os.path.join(ARTIFACTS_DIR, "Y_all.npy"))
+H_all   = np.load(os.path.join(ARTIFACTS_DIR, "H_all.npy"))
+sat_ids = np.load(os.path.join(ARTIFACTS_DIR, "sat_ids.npy"))
+
+T = X_all.shape[1]      # 15 steps (0..14d)
+F = X_all.shape[2]      # feature count
+
+# ---- Hyperparameter grid ----
+param_grid = {
+    "learning_rate": [0.0001, 0.001],
+    "batch_size":    [1028, 2056, 4112],
+    "epochs":        [100]
+}
+PATIENCE = 10  # early stopping patience
+
+# 1D CNN: 8 conv layers (64 filters), ReLU
+def build_cnn_1d(input_timesteps: int, input_features: int, lr: float) -> tf.keras.Model:
+    inp = layers.Input(shape=(input_timesteps, input_features))
+    x = inp
+    for _ in range(8):
+        x = layers.Conv1D(64, kernel_size=3, padding="same", activation="relu")(x)
+    out = layers.Conv1D(3, kernel_size=1, padding="same", activation=None)(x)  # (N,T,3) normalized space
+    m = models.Model(inp, out)
+    m.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr), loss="mse")
+    return m
+
+def fit_eval_one_sat(sat: int):
+    #  slice this satellite
+    idx = np.where(sat_ids == sat)[0]
+    Xs, Ys, Hs = X_all[idx], Y_all[idx], H_all[idx]
+
+    #  train/val/test split (per satellite)
+    X_tv, X_te, Y_tv, Y_te, H_tv, H_te = train_test_split(
+        Xs, Ys, Hs, test_size=0.2, random_state=42
+    )
+
+    #  compute normalization on TRAIN subset only
+    X_tr_stats, X_va_stats, Y_tr_stats, Y_va_stats = train_test_split(
+        X_tv, Y_tv, test_size=0.2, random_state=123
+    )
+
+    # Feature normalization (per-feature over all steps)
+    x_mean = X_tr_stats.reshape(-1, F).mean(axis=0)
+    x_std  = X_tr_stats.reshape(-1, F).std(axis=0) + 1e-8
+
+    # Label normalization (per-channel over all steps) — normalize RAC jointly
+    y_mean = Y_tr_stats.reshape(-1, 3).mean(axis=0)
+    y_std  = Y_tr_stats.reshape(-1, 3).std(axis=0) + 1e-8
+
+    def norm_inputs(X): return (X - x_mean[None, None, :]) / x_std[None, None, :]
+    def norm_labels(Y): return (Y - y_mean[None, None, :]) / y_std[None, None, :]
+
+    X_tv_n = norm_inputs(X_tv);  Y_tv_n = norm_labels(Y_tv)
+    X_te_n = norm_inputs(X_te);  Y_te_n = norm_labels(Y_te)
+
+    # --- K-Fold CV for HPO on tv set ---
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    best_cfg = None
+    best_cv  = float("inf")
+    best_fold_paths = []
+
+    sat_model_dir = os.path.join(MODELS_DIR, f"sat_{sat}")
+    sat_art_dir   = os.path.join(ARTIFACTS_DIR, f"sat_{sat}")
+    os.makedirs(sat_model_dir, exist_ok=True)
+    os.makedirs(sat_art_dir, exist_ok=True)
+
+    for lr in param_grid["learning_rate"]:
+        for bs in param_grid["batch_size"]:
+            for n_epochs in param_grid["epochs"]:
+                cv_losses = []
+                fold_paths = []
+                fold_id = 0
+
+                for tr_idx, va_idx in kf.split(X_tv_n):
+                    fold_id += 1
+                    X_tr, X_va = X_tv_n[tr_idx], X_tv_n[va_idx]
+                    Y_tr, Y_va = Y_tv_n[tr_idx], Y_tv_n[va_idx]
+
+                    model = build_cnn_1d(T, F, lr)
+                    ckpt = os.path.join(sat_model_dir, f"cnn_fold{fold_id}_lr{lr}_bs{bs}.keras")
+                    cb = [
+                        EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True),
+                        ModelCheckpoint(ckpt, monitor="val_loss", save_best_only=True, save_weights_only=False)
+                    ]
+                    hist = model.fit(
+                        X_tr, Y_tr,
+                        validation_data=(X_va, Y_va),
+                        epochs=n_epochs,
+                        batch_size=bs,
+                        callbacks=cb,
+                        verbose=0
+                    )
+                    cv_losses.append(float(np.min(hist.history["val_loss"])))
+                    fold_paths.append(ckpt)
+
+                avg_cv = float(np.mean(cv_losses))
+                print(f"[sat {sat}] CV lr={lr} bs={bs} epochs={n_epochs} -> {avg_cv:.6f}")
+
+                if avg_cv < best_cv:
+                    best_cv  = avg_cv
+                    best_cfg = {"learning_rate": lr, "batch_size": bs, "epochs": n_epochs}
+                    best_fold_paths = fold_paths
+
+    with open(os.path.join(sat_model_dir, "best_hpo.json"), "w") as f:
+        json.dump({"best_cfg": best_cfg, "cv_loss": best_cv, "fold_models": best_fold_paths}, f, indent=2)
+    print(f"[sat {sat}] Best HPO: {best_cfg} (CV val_loss={best_cv})")
+
+    # --- Retrain best config on full tv, then evaluate on held-out TEST ---
+    final = build_cnn_1d(T, F, best_cfg["learning_rate"])
+    final_ckpt = os.path.join(sat_model_dir, "final_best.keras")
+    cb = [
+        EarlyStopping(monitor="val_loss", patience=PATIENCE, restore_best_weights=True),
+        ModelCheckpoint(final_ckpt, monitor="val_loss", save_best_only=True, save_weights_only=False)
+    ]
+    _ = final.fit(
+        X_tv_n, Y_tv_n,
+        validation_split=0.1,
+        epochs=best_cfg["epochs"],
+        batch_size=best_cfg["batch_size"],
+        callbacks=cb,
+        verbose=0
+    )
+    final.save(os.path.join(sat_model_dir, "final_trained.keras"))
+    print(f"[sat {sat}]  Saved final model(s) to: {sat_model_dir}")
+
+    # evaluate on TEST (denormalize back to km)
+    Y_pred_n = final.predict(X_te_n, verbose=0)                # (N,15,3) normalized
+    Y_pred   = Y_pred_n * y_std[None, None, :] + y_mean[None, None, :]
+    Y_true   = Y_te                                           # already km
+
+    #Save arrays for aggregation
+    sat_art_dir = os.path.join(ARTIFACTS_DIR, f"sat_{sat}")
+    os.makedirs(sat_art_dir, exist_ok=True)
+
+    np.save(os.path.join(sat_art_dir, "Y_true_km.npy"), Y_true)        # (N_test, 15, 3)
+    np.save(os.path.join(sat_art_dir, "Y_pred_km.npy"), Y_pred)        # (N_test, 15, 3)
+    np.save(os.path.join(sat_art_dir, "H_test_days.npy"), H_te)        # (N_test, 15)
+
+    # also save residuals (baseline error minus predicted correction
+    Y_res = Y_true - Y_pred                                            # (N_test, 15, 3)
+    np.save(os.path.join(sat_art_dir, "residual_km.npy"), Y_res)
+
+    print(f"[sat {sat}] 💾 Saved test arrays (Y_true_km, Y_pred_km, residual_km, H_test_days) to {sat_art_dir}")
+
+    # Metrics helpers
+    def metrics_paper_aligned(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+        err = y_true - y_pred
+        e2  = err**2
+        mse = e2.mean(axis=(0,1))                 # (3,)
+        rmse = np.sqrt(mse)                       # (3,)
+        rms3d = np.sqrt((e2.sum(axis=2)).mean())  # scalar (over N*T)
+        return {
+            "MSE_R": float(mse[0]), "MSE_A": float(mse[1]), "MSE_C": float(mse[2]),
+            "RMSE_R": float(rmse[0]), "RMSE_A": float(rmse[1]), "RMSE_C": float(rmse[2]),
+            "RMS_3D": float(rms3d)
+        }
+
+    def horizon_report(H: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray, days=range(0,15)):
+        rep = {}
+        for d in days:
+            mask = (H == d)  # (N,15) bool
+            if not np.any(mask):
+                continue
+            yt = y_true[mask]  # (K,3)
+            yp = y_pred[mask]
+            err = yt - yp
+            e2  = err**2
+            mse = e2.mean(axis=0)
+            rmse = np.sqrt(mse)
+            rms3d = np.sqrt((e2.sum(axis=1)).mean())
+            rep[int(d)] = {
+                "MSE_R": float(mse[0]), "MSE_A": float(mse[1]), "MSE_C": float(mse[2]),
+                "RMSE_R": float(rmse[0]), "RMSE_A": float(rmse[1]), "RMSE_C": float(rmse[2]),
+                "RMS_3D": float(rms3d)
+            }
+        return rep
+
+    # Baseline = zeros
+    baseline = metrics_paper_aligned(Y_true, np.zeros_like(Y_true))
+    modelmet = metrics_paper_aligned(Y_true, Y_pred)
+
+    def pm_improvement(m_model: dict, m_base: dict) -> dict:
+        out = {}
+        for k in ["RMSE_R","RMSE_A","RMSE_C","RMS_3D"]:
+            out["PM_"+k] = 100.0 * (1.0 - (m_model[k] / max(1e-9, m_base[k])))
+        return out
+
+    pm_overall = pm_improvement(modelmet, baseline)
+    by_h = horizon_report(H_te, Y_true, Y_pred, days=range(0,15))
+
+    report = {
+        "satellite": int(sat),
+        "best_hpo": best_cfg,
+        "cv_val_loss": best_cv,
+        "norm_stats": {
+            "x_mean": x_mean.tolist(), "x_std": x_std.tolist(),
+            "y_mean": y_mean.tolist(), "y_std": y_std.tolist()
+        },
+        "test_overall": modelmet,
+        "test_overall_baseline": baseline,
+        "test_overall_PM_vs_baseline_percent": pm_overall,
+        "test_by_horizon": by_h
+    }
+    rpt_path = os.path.join(sat_art_dir, f"sat{sat}_model_test_report.json")
+    with open(rpt_path, "w") as f:
+        json.dump(report, f, indent=2)
+    print(f"[sat {sat}] 📄 Saved evaluation report to: {rpt_path}")
+
+unique_sats = np.unique(sat_ids)
+print("Satellites found:", unique_sats.tolist())
+for sat in unique_sats:
+    fit_eval_one_sat(int(sat))
+
+
+
+
+# CNN RESULTS AGGREGATION
+
+import os, json
+import numpy as np
+import matplotlib.pyplot as plt
+
+ART = "outputs/artifacts"
+FIG = "outputs/figs_cnn_fractional"
+PLOTSDIR = "outputs/plots_ready_cnn_fractional"
+os.makedirs(FIG, exist_ok=True)
+os.makedirs(PLOTSDIR, exist_ok=True)
+
+def rmse(v): return float(np.sqrt(np.mean(np.square(v))))
+def pm(b, r): return 100.0 * (1.0 - r / max(1e-12, b))
+
+def plot_axis(h, e_base, e_pred, e_res, axis_name, pm_val, outpath):
+    plt.figure(figsize=(7.5, 4.5), dpi=140)
+    plt.scatter(h, e_base, s=6, alpha=0.25,
+                label="TLE prediction error", edgecolors="none")
+    plt.scatter(h, e_pred, s=6, alpha=0.25,
+                label="CNN-predicted error", facecolors="none",
+                edgecolors="magenta", linewidths=0.6)
+    plt.scatter(h, e_res, s=6, alpha=0.6,
+                label="Residual error", color="black")
+    plt.axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
+    plt.xlim(0, 14)
+    plt.xlabel("Prediction time length (day)")
+    plt.ylabel(f"e{axis_name} (km)")
+    plt.title(f"{axis_name}-axis: PM = {pm_val:.1f}%")
+    plt.legend(loc="upper left", frameon=False)
+    plt.tight_layout()
+    plt.savefig(outpath)
+    plt.close()
+    print("Saved:", outpath)
+
+def flatten_with_mask(Y, Hfrac, comp_idx):
+    mask = np.isfinite(Hfrac) & np.isfinite(Y[..., comp_idx])
+    return Hfrac[mask], Y[..., comp_idx][mask]
+
+sat_dirs = [d for d in os.listdir(ART) if d.startswith("sat_")]
+if not sat_dirs:
+    raise RuntimeError("No satellites found in artifacts.")
+
+for sd in sorted(sat_dirs):
+    sat_id = sd.split("_")[1]
+    sat_dir = os.path.join(ART, sd)
+
+    fYt = os.path.join(sat_dir, "Y_true_km.npy")
+    fYp = os.path.join(sat_dir, "Y_pred_km.npy")
+    fHf = os.path.join(sat_dir, "H_frac_days.npy")   # <-- fractional horizons
+    fHi = os.path.join(sat_dir, "H_test_days.npy")   # <-- integer fallback
+
+    if not (os.path.exists(fYt) and os.path.exists(fYp) and (os.path.exists(fHf) or os.path.exists(fHi))):
+        print(f"[{sd}] Missing arrays, skipping.")
+        continue
+
+    Y_true = np.load(fYt)
+    Y_pred = np.load(fYp)
+    Y_res  = Y_true - Y_pred
+
+    if os.path.exists(fHf):
+        Hfrac = np.load(fHf)
+    else:
+        Hint = np.load(fHi)
+        Hfrac = np.where(Hint >= 0, Hint.astype(float), np.nan)
+
+    # Compute PMs
+    maskR = np.isfinite(Hfrac) & np.isfinite(Y_true[...,0])
+    maskA = np.isfinite(Hfrac) & np.isfinite(Y_true[...,1])
+    maskC = np.isfinite(Hfrac) & np.isfinite(Y_true[...,2])
+
+    base_R = rmse(Y_true[...,0][maskR]); res_R = rmse(Y_res[...,0][maskR])
+    base_A = rmse(Y_true[...,1][maskA]); res_A = rmse(Y_res[...,1][maskA])
+    base_C = rmse(Y_true[...,2][maskC]); res_C = rmse(Y_res[...,2][maskC])
+
+    pmR, pmA, pmC = pm(base_R,res_R), pm(base_A,res_A), pm(base_C,res_C)
+
+    # Scatter plots (fractional Δt)
+    hR, eR_b = flatten_with_mask(Y_true, Hfrac, 0)
+    _,  eR_p = flatten_with_mask(Y_pred, Hfrac, 0)
+    _,  eR_r = flatten_with_mask(Y_res,  Hfrac, 0)
+
+    hA, eA_b = flatten_with_mask(Y_true, Hfrac, 1)
+    _,  eA_p = flatten_with_mask(Y_pred, Hfrac, 1)
+    _,  eA_r = flatten_with_mask(Y_res,  Hfrac, 1)
+
+    hC, eC_b = flatten_with_mask(Y_true, Hfrac, 2)
+    _,  eC_p = flatten_with_mask(Y_pred, Hfrac, 2)
+    _,  eC_r = flatten_with_mask(Y_res,  Hfrac, 2)
+
+    plot_axis(hR, eR_b, eR_p, eR_r, "R", pmR,
+              os.path.join(FIG, f"sat{sat_id}_eR.png"))
+    plot_axis(hA, eA_b, eA_p, eA_r, "A", pmA,
+              os.path.join(FIG, f"sat{sat_id}_eA.png"))
+    plot_axis(hC, eC_b, eC_p, eC_r, "C", pmC,
+              os.path.join(FIG, f"sat{sat_id}_eC.png"))
+
+print("CNN fractional-horizon figures saved in:", FIG)
+
+
+
+
+
+
+import os, json
+import numpy as np
+
+ART = "outputs/artifacts"
+sats = [d for d in os.listdir(ART) if d.startswith("sat_")]
+
+per_sat_reports = []
+
+for sat_dir in sats:
+    sat_id = sat_dir.split("_")[1]
+    rpt_path = os.path.join(ART, sat_dir, f"sat{sat_id}_model_test_report.json")
+    if not os.path.exists(rpt_path):
+        continue
+
+    with open(rpt_path, "r") as f:
+        rpt = json.load(f)
+
+    # Load test arrays
+    Y_true = np.load(os.path.join(ART, sat_dir, "Y_true_km.npy"))   # already denormalized in Part C
+    Y_pred = np.load(os.path.join(ART, sat_dir, "Y_pred_km.npy"))   # already denormalized in Part C
+    H_test = np.load(os.path.join(ART, sat_dir, "H_test_days.npy"))
+
+    # store everything for later aggregation
+    per_sat_reports.append({
+        "sat": int(sat_id),
+        "report": rpt,
+        "Y_true": Y_true,
+        "Y_pred": Y_pred,
+        "H_test": H_test
+    })
+
+print(f"Loaded {len(per_sat_reports)} per-satellite reports.")
+
+
+
+
+import numpy as np
+
+EPS = 1e-9  # tiny floor to avoid div-by-zero
+
+def metrics_over_NT(y_true: np.ndarray, y_pred: np.ndarray):
+    """
+    y_* shape: (N, T, 3). Returns dict with RMSE_R, RMSE_A, RMSE_C, RMS_3D.
+    """
+    err = y_true - y_pred
+    e2  = err**2
+    rmse_axis = np.sqrt(e2.mean(axis=(0,1)))            # (3,)
+    rms3d     = np.sqrt((e2.sum(axis=2)).mean())        # scalar over N*T
+    return {
+        "RMSE_R": float(rmse_axis[0]),
+        "RMSE_A": float(rmse_axis[1]),
+        "RMSE_C": float(rmse_axis[2]),
+        "RMS_3D": float(rms3d)
+    }
+
+def metrics_over_K(y_true: np.ndarray, y_pred: np.ndarray):
+    """
+    y_* shape: (K, 3). Same outputs as above, but over a 2D slice (one horizon).
+    """
+    err = y_true - y_pred                                # (K,3)
+    e2  = err**2
+    rmse_axis = np.sqrt(e2.mean(axis=0))                 # (3,)
+    rms3d     = np.sqrt((e2.sum(axis=1)).mean())         # scalar
+    return {
+        "RMSE_R": float(rmse_axis[0]),
+        "RMSE_A": float(rmse_axis[1]),
+        "RMSE_C": float(rmse_axis[2]),
+        "RMS_3D": float(rms3d)
+    }
+
+def pm_from_metrics(m_model: dict, m_base: dict):
+    out = {}
+    for k in ["RMSE_R","RMSE_A","RMSE_C","RMS_3D"]:
+        denom = max(EPS, m_base[k])
+        out["PM_"+k] = 100.0 * (1.0 - (m_model[k] / denom))
+    return out
+
+def iqr_mask_per_component(values: np.ndarray):
+    """
+    values: (K,)  -> boolean mask (K,)
+    Outer fence per paper: [Q1 - 3*IQR, Q3 + 3*IQR].
+    """
+    if values.size == 0:
+        return np.zeros_like(values, dtype=bool)
+    q1, q3 = np.percentile(values, [25, 75])
+    iqr = q3 - q1
+    lo, hi = q1 - 3*iqr, q3 + 3*iqr
+    return (values >= lo) & (values <= hi)
+
+def iqr_filter_day_slice(y_true_day: np.ndarray, y_pred_day: np.ndarray):
+    """
+    y_*_day: (K,3) slice for a single horizon.
+    Build mask as the intersection of per-axis masks on the *baseline errors* (y_true_day vs 0).
+    Returns filtered (y_true_day_f, y_pred_day_f).
+    """
+    # baseline errors per component at this horizon
+    e_base = y_true_day                                  # baseline is "no correction" => 0
+    mR = iqr_mask_per_component(e_base[:,0])
+    mA = iqr_mask_per_component(e_base[:,1])
+    mC = iqr_mask_per_component(e_base[:,2])
+    keep = mR & mA & mC
+    return y_true_day[keep], y_pred_day[keep]
+
+
+
+
+# Macro-average across satellites (unchanged, for completeness)
+macro_pms = []
+
+for sat in per_sat_reports:
+    Y_true = sat["Y_true"]     # (N,T,3) km
+    Y_pred = sat["Y_pred"]     # (N,T,3) km
+
+    base = metrics_over_NT(Y_true, np.zeros_like(Y_true))
+    modl = metrics_over_NT(Y_true, Y_pred)
+    macro_pms.append(pm_from_metrics(modl, base))
+
+macro_avg = {k: float(np.mean([p[k] for p in macro_pms])) for k in macro_pms[0]}
+print("Macro-average PM across satellites (no IQR, pooled over days):")
+for k, v in macro_avg.items():
+    print(f"  {k}: {v:.2f}%")
+
+
+
+
+import os, json, numpy as np
+import matplotlib.pyplot as plt
+
+ART = "outputs/artifacts"
+FIG = "outputs/figs_paper_per_sat"
+os.makedirs(FIG, exist_ok=True)
+
+def rmse(v): return float(np.sqrt(np.mean(np.square(v))))
+
+def pm_vs_baseline(y_true, y_pred):
+    """
+    y_true, y_pred: (N,T,3) km arrays (true = TLE error; pred = model-predicted error).
+    Returns dict of RMSE_* for baseline (true vs 0) and model (residual = true - pred),
+    plus PM per axis and RMS_3D.
+    """
+    # Baseline errors (light-blue in plots): e_base = y_true
+    e_base = y_true
+    # Residual errors after correction (black in plots): e_res = y_true - y_pred
+    e_res  = y_true - y_pred
+
+    # RMSE per axis over all samples & horizons
+    base_rmse_R = rmse(e_base[...,0]); base_rmse_A = rmse(e_base[...,1]); base_rmse_C = rmse(e_base[...,2])
+    res_rmse_R  = rmse(e_res[...,0]);  res_rmse_A  = rmse(e_res[...,1]);  res_rmse_C  = rmse(e_res[...,2])
+
+    # 3D RMS (sum components per sample, then mean)
+    base_rms3d = float(np.sqrt(np.mean(np.sum(e_base**2, axis=2))))
+    res_rms3d  = float(np.sqrt(np.mean(np.sum(e_res**2,  axis=2))))
+
+    def pm(a,b):
+        denom = max(1e-12, a)
+        return 100.0*(1.0 - b/denom)
+
+    return {
+        "PM_RMSE_R": pm(base_rmse_R, res_rmse_R),
+        "PM_RMSE_A": pm(base_rmse_A, res_rmse_A),
+        "PM_RMSE_C": pm(base_rmse_C, res_rmse_C),
+        "PM_RMS_3D": pm(base_rms3d,  res_rms3d),
+        "rmse_base": (base_rmse_R, base_rmse_A, base_rmse_C, base_rms3d),
+        "rmse_res":  (res_rmse_R,  res_rmse_A,  res_rmse_C,  res_rms3d)
+    }
+
+def plot_sat_axis(h_days, e_base, e_pred, e_res, axis_name, pm_value, outpath):
+    plt.figure(figsize=(7.5, 4.5), dpi=140)
+    plt.scatter(h_days, e_base, s=6, alpha=0.25, label="TLE prediction error", edgecolors="none")
+    plt.scatter(h_days, e_pred, s=6, alpha=0.25, label="CNN-predicted error", facecolors="none", edgecolors="magenta", linewidths=0.6)
+    plt.scatter(h_days, e_res,  s=6, alpha=0.6,  label="Residual error", color="black")
+    plt.axhline(0.0, color="gray", linewidth=0.8, linestyle="--")
+    plt.xlim(0, 14)
+    plt.xlabel("Prediction time length (day)")
+    plt.ylabel(f"e{axis_name} (km)")
+    plt.title(f"{axis_name}-axis: PM = {pm_value:.1f}%")
+    plt.legend(loc="upper left", frameon=False)
+    plt.tight_layout(); plt.savefig(outpath); plt.close()
+    print("Saved:", outpath)
+
+sat_dirs = [d for d in os.listdir(ART) if d.startswith("sat_") and os.path.isdir(os.path.join(ART,d))]
+print("Found artifact dirs:", sat_dirs if sat_dirs else ["<none>"])
+
+summary_rows = []  # for a per-satellite table like the paper’s Table 2
+
+for sd in sorted(sat_dirs):
+    sat_id = sd.split("_")[1]
+    p = os.path.join(ART, sd)
+
+    f_true = os.path.join(p, "Y_true_km.npy")
+    f_pred = os.path.join(p, "Y_pred_km.npy")
+    f_res  = os.path.join(p, "residual_km.npy")
+    f_H    = os.path.join(p, "H_test_days.npy")
+    if not (os.path.exists(f_true) and os.path.exists(f_pred) and os.path.exists(f_H)):
+        print(f"[{sd}] Missing arrays, skipping.")
+        continue
+
+    Y_true = np.load(f_true)
+    Y_pred = np.load(f_pred)
+    H_days = np.load(f_H).astype(float)
+
+    # Compute PMs (paper metric)
+    perf = pm_vs_baseline(Y_true, Y_pred)
+    PMR, PMA, PMC, PM3D = perf["PM_RMSE_R"], perf["PM_RMSE_A"], perf["PM_RMSE_C"], perf["PM_RMS_3D"]
+    print(f"[sat {sat_id}] PM_R={PMR:.1f}% PM_A={PMA:.1f}% PM_C={PMC:.1f}% PM_3D={PM3D:.1f}%")
+    summary_rows.append([int(sat_id), PMR, PMA, PMC, PM3D])
+
+    # Prepare scatter series per axis
+    # baseline = light-blue = Y_true; predicted = magenta = Y_pred; residual = black = Y_true - Y_pred
+    e_base_R = Y_true[...,0].ravel(); e_pred_R = Y_pred[...,0].ravel(); e_res_R = (Y_true - Y_pred)[...,0].ravel()
+    e_base_A = Y_true[...,1].ravel(); e_pred_A = Y_pred[...,1].ravel(); e_res_A = (Y_true - Y_pred)[...,1].ravel()
+    e_base_C = Y_true[...,2].ravel(); e_pred_C = Y_pred[...,2].ravel(); e_res_C = (Y_true - Y_pred)[...,2].ravel()
+    h_vec    = H_days.ravel()
+
+    # Save three per-satellite figures (R, A, C)
+    out_R = os.path.join(FIG, f"sat{sat_id}_eR.png")
+    out_A = os.path.join(FIG, f"sat{sat_id}_eA.png")
+    out_C = os.path.join(FIG, f"sat{sat_id}_eC.png")
+    plot_sat_axis(h_vec, e_base_R, e_pred_R, e_res_R, "R", PMR,  out_R)
+    plot_sat_axis(h_vec, e_base_A, e_pred_A, e_res_A, "A", PMA,  out_A)
+    plot_sat_axis(h_vec, e_base_C, e_pred_C, e_res_C, "C", PMC,  out_C)
+
+if summary_rows:
+    print("\nPer-satellite PM (%%) vs baseline (paper metric):")
+    print("SAT_ID | PM_R  | PM_A  | PM_C  | PM_3D")
+    for r in sorted(summary_rows, key=lambda x: x[0]):
+        print(f"{r[0]:5d} | {r[1]:5.1f} | {r[2]:5.1f} | {r[3]:5.1f} | {r[4]:5.1f}")
+
+
+import shutil, os
+
+FIG_DIR = "outputs/figs_paper_per_sat"
+ZIP_PATH = "satellite_pngs.zip"
+
+# Create zip of all PNGs in the figure folder
+shutil.make_archive("satellite_pngs", "zip", FIG_DIR)
+
+print(f"📦 Zipped all PNGs into {ZIP_PATH}. Now you can download it.")
+from google.colab import files
+files.download("satellite_pngs.zip")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
