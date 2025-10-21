@@ -1,0 +1,526 @@
+!pip install sgp4
+!pip install numpy
+!pip install tensorflow
+
+
+
+import json, torch, torch.nn as nn
+import numpy as np
+
+import os
+import glob
+from collections import Counter, defaultdict
+
+from datetime import datetime, timedelta
+
+import re
+import math
+from sgp4.api import Satrec, WGS72
+from datetime import datetime, timedelta
+
+from sklearn.model_selection import KFold,train_test_split
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Flatten, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+
+
+
+# helper functions
+
+def tle_epoch_to_datetime(epoch):
+    year = int(epoch // 1000)
+    day_of_year = epoch % 1000
+    year += 2000 if year < 57 else 1900
+    int_day = int(day_of_year)
+    fractional_day = day_of_year - int_day
+    base = datetime(year, 1, 1) + timedelta(days=int_day - 1)
+    return base + timedelta(days=fractional_day)
+
+def parse_bstar(line1):
+    raw = line1[53:61].strip()
+    try:
+        m = re.fullmatch(r"([ +-]?\d{5})([-+]\d)", raw)
+        if m:
+            base, exp = m.groups()
+            return float(f"{base[0]}.{base[1:]}e{exp}")
+        raw_clean = raw.replace('+','').replace('-','')
+        digits = re.sub(r"[^\d]", "", raw_clean)
+        return float(f"0.{digits}") if digits else 0.0
+    except:
+        return 0.0
+
+
+def to_sat(line1, line2):
+    return Satrec.twoline2rv(line1, line2, WGS72)
+
+
+def dt_to_jd_fr(dt):
+    jd = 367*dt.year - (7*(dt.year + (dt.month + 9)//12))//4 + (275*dt.month)//9 + dt.day + 1721013.5
+    fr = (dt.hour + dt.minute/60 + dt.second/3600)/24
+    return jd, fr
+
+def sgp4_posvel(sat, dt):
+    jd, fr = dt_to_jd_fr(dt)
+    err, r, v = sat.sgp4(jd, fr)
+    if err != 0:
+        raise RuntimeError(f"SGP4 error code {err}")
+    return np.array(r), np.array(v)
+
+def eci_to_rsw(r_eci, v_eci, e_eci):
+    r = r_eci; v = v_eci
+    h = np.cross(r, v)
+    rhat = r / np.linalg.norm(r)
+    what = h / np.linalg.norm(h)
+    shat = np.cross(what, rhat)
+    M = np.stack([rhat, shat, what], axis=1)  # columns
+    return (M.T @ e_eci).astype(np.float32)
+
+def parse_tle_lines(path):
+    lines = [ln.strip() for ln in open(path) if ln.strip()]
+    out = []
+    i = 0
+    while i < len(lines)-1:
+        l1, l2 = lines[i], lines[i+1]
+        if l1[0] == '1' and l2[0] == '2':
+            sat_id = int(l1[2:7])
+            year = int(l1[18:20]); year += 2000 if year < 57 else 1900
+            day = float(l1[20:32])
+            out.append({"sat_id": sat_id, "line1": l1, "line2": l2, "epoch": (year % 1000) * 1000 + day})
+            i += 2
+        else:
+            i += 1
+    return out
+
+
+def build_dataset(input_tle_txt, out_json, max_hours_ahead=336):
+    entries = parse_tle_lines(input_tle_txt)
+    entries.sort(key=lambda e: (e["sat_id"], e["epoch"]))
+
+    from collections import defaultdict
+    by_sat = defaultdict(list)
+    for e in entries: by_sat[e["sat_id"]].append(e)
+
+    data = []
+    for sat_id, seq in by_sat.items():
+        for i in range(len(seq)-1):
+            base = seq[i]
+            try:
+                t0 = tle_epoch_to_datetime(base["epoch"])
+                sat0 = to_sat(base["line1"], base["line2"])
+                r0, v0 = sgp4_posvel(sat0, t0)
+                bstar = parse_bstar(base["line1"])
+            except Exception:
+                continue
+
+            for j in range(i+1, len(seq)):
+                fut = seq[j]
+                tf = tle_epoch_to_datetime(fut["epoch"])
+                dh = (tf - t0).total_seconds()/3600.0
+                if dh <= 0 or dh > max_hours_ahead:
+                    continue
+                try:
+                    r_pred, _   = sgp4_posvel(sat0, tf)                         # base TLE → tf
+                    sat_true    = to_sat(fut["line1"], fut["line2"])
+                    r_true, v_t = sgp4_posvel(sat_true, tf)                    # future TLE at tf (truth)
+                except Exception:
+                    continue
+
+                e_eci = r_pred - r_true                                        # km
+                e_rsw = eci_to_rsw(r_true, v_t, e_eci)                         # (R,A,C) km
+                x_feat = [dh/24.0] + r0.tolist() + [float(bstar)] + r_pred.tolist() # Convert numpy arrays to lists
+
+                data.append({
+                    "sat_id": int(sat_id),
+                    "delta_t_hr": float(dh),
+                    "delta_t_days": float(dh/24.0),
+                    "x": [float(val) for val in x_feat],                    # features, ensure float
+                    "y_rsw": [float(val) for val in e_rsw.tolist()]         # target: error in R/A/C km, ensure float
+                })
+
+    with open(out_json, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f" {len(data)} samples → {out_json}")
+
+if __name__ == "__main__":
+    build_dataset("all_tles_fully_covered.txt", "tle_lstm_dataset_rsw.json", 14*24)
+
+
+
+
+
+
+
+DATA_JSON = "tle_lstm_dataset_rsw.json"
+MODELDIR  = "outputs/lstm_models"
+os.makedirs(MODELDIR, exist_ok=True)
+
+LEARNING_RATE = .001
+BATCH_SIZE    = 4112
+EPOCHS        = 100
+PATIENCE      = 10
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class LSTMReg(nn.Module):
+    def __init__(self, input_dim, hidden=64, layers=8, output_dim=3):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden, num_layers=layers, batch_first=True)
+        self.fc   = nn.Linear(hidden, output_dim)
+    def forward(self, x):
+        out,_ = self.lstm(x); out = out[:,-1,:]
+        return self.fc(out)
+
+with open(DATA_JSON,"r") as f:
+    rows = json.load(f)
+
+by_sat = defaultdict(list)
+for r in rows:
+    d = dict(r)
+    d["h_int"] = int(round(d["delta_t_days"]))
+    by_sat[int(r["sat_id"])].append(d)
+
+def make_loader(X, Y, bs, shuffle):
+    X_t = torch.tensor(X[:,None,:], dtype=torch.float32)
+    Y_t = torch.tensor(Y,            dtype=torch.float32)
+    ds  = torch.utils.data.TensorDataset(X_t, Y_t)
+    return torch.utils.data.DataLoader(ds, batch_size=bs, shuffle=shuffle, drop_last=False)
+
+def train_one_sat(sat_id, items):
+    items.sort(key=lambda r: (r["h_int"], r["delta_t_days"]))
+    X = np.array([r["x"] for r in items], dtype=np.float32)
+    Y = np.array([r["y_rsw"] for r in items], dtype=np.float32)
+
+    X_tv, X_te, Y_tv, Y_te = train_test_split(X, Y, test_size=0.1, random_state=42)
+    X_tr, X_va, Y_tr, Y_va = train_test_split(X_tv, Y_tv, test_size=0.1111, random_state=123)
+
+    x_mean, x_std = X_tr.mean(axis=0), X_tr.std(axis=0) + 1e-8
+    y_mean, y_std = Y_tr.mean(axis=0), Y_tr.std(axis=0) + 1e-8
+
+    def nx(A): return (A - x_mean[None,:]) / x_std[None,:]
+    def ny(A): return (A - y_mean[None,:]) / y_std[None,:]
+
+    X_tr_n, Y_tr_n = nx(X_tr), ny(Y_tr)
+    X_va_n, Y_va_n = nx(X_va), ny(Y_va)
+
+    train_loader = make_loader(X_tr_n, Y_tr_n, BATCH_SIZE, shuffle=True)
+    val_loader   = make_loader(X_va_n, Y_va_n, BATCH_SIZE, shuffle=False)
+
+    model = LSTMReg(input_dim=X.shape[1]).to(device)
+    opt   = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    lossf = nn.MSELoss()
+
+    best_val, patience, best_state = float("inf"), PATIENCE, None
+    for epoch in range(1, EPOCHS+1):
+        model.train(); tr_loss = 0.0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt.zero_grad(); yp = model(xb); loss = lossf(yp, yb)
+            loss.backward(); opt.step()
+            tr_loss += loss.item() * xb.size(0)
+        tr_loss /= len(train_loader.dataset)
+
+        model.eval(); va_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                va_loss += lossf(model(xb), yb).item() * xb.size(0)
+        va_loss /= len(val_loader.dataset)
+        print(f"[sat {sat_id}] Epoch {epoch:03d}/{EPOCHS} - train={tr_loss:.6f} val={va_loss:.6f}")
+
+        if va_loss < best_val - 1e-6:
+            best_val, best_state, patience = va_loss, {k:v.cpu().clone() for k,v in model.state_dict().items()}, PATIENCE
+        else:
+            patience -= 1
+            if patience == 0:
+                print(f"[sat {sat_id}] Early stopped at {epoch}")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    # Save model + norm stats
+    torch.save(model.state_dict(), os.path.join(MODELDIR, f"lstm_sat{sat_id}.pth"))
+    with open(os.path.join(MODELDIR, f"lstm_sat{sat_id}_norm.json"), "w") as f:
+        json.dump({"x_mean": x_mean.tolist(), "x_std": x_std.tolist(),
+                   "y_mean": y_mean.tolist(), "y_std": y_std.tolist()}, f, indent=2)
+    print(f"[sat {sat_id}] Model trained and saved.")
+
+for sid, items in sorted(by_sat.items()):
+    train_one_sat(sid, items)
+
+
+
+
+
+
+
+
+
+DATA_JSON = "tle_lstm_dataset_rsw.json"
+MODELDIR  = "outputs/lstm_models"
+ARTDIR    = "outputs/artifacts"
+os.makedirs(ARTDIR, exist_ok=True)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+T = 15  # horizons 0..14
+
+def rmse(arr):
+    arr = np.asarray(arr)
+    return float(np.sqrt(np.mean(np.square(arr))))
+
+def pm_pair(b, r):  # percent improvement vs baseline
+    return 100.0*(1.0 - r/max(1e-12, b))
+
+class LSTMReg(torch.nn.Module):
+    def __init__(self, input_dim, hidden=64, layers=8, output_dim=3):
+        super().__init__()
+        self.lstm = torch.nn.LSTM(input_dim, hidden, num_layers=layers, batch_first=True)
+        self.fc   = torch.nn.Linear(hidden, output_dim)
+    def forward(self, x):
+        out,_ = self.lstm(x)      # (N, 1, hidden)
+        out = out[:, -1, :]       # (N, hidden)
+        return self.fc(out)       # (N, 3)
+
+# Load JSON rows and group per satellite
+with open(DATA_JSON, "r") as f:
+    rows = json.load(f)
+
+by_sat = defaultdict(list)
+for r in rows:
+    d = dict(r)
+    d["h_int"] = int(round(d["delta_t_days"]))
+    by_sat[int(r["sat_id"])].append(d)
+
+def eval_one_sat(sat_id, items):
+    # sort stable so split is reproducible
+    items.sort(key=lambda r: (r["h_int"], r["delta_t_days"]))
+
+    X = np.array([r["x"] for r in items], dtype=np.float32)       # (N,F)
+    Y = np.array([r["y_rsw"] for r in items], dtype=np.float32)   # (N,3)
+    Hf= np.array([r["delta_t_days"] for r in items], dtype=np.float32)  # (N,)
+    Hi= np.array([r["h_int"]        for r in items], dtype=np.int32)    # (N,)
+
+    # Same split seeds/rates used during training
+    X_tv, X_te, Y_tv, Y_te, Hf_tv, Hf_te, Hi_tv, Hi_te = train_test_split(
+        X, Y, Hf, Hi, test_size=0.1, random_state=42
+    )
+    X_tr, X_va, Y_tr, Y_va = train_test_split(
+        X_tv, Y_tv, test_size=0.1111, random_state=123
+    )
+
+    # Load normalization stats saved by training
+    norm_path = os.path.join(MODELDIR, f"lstm_sat{sat_id}_norm.json")
+    if not os.path.exists(norm_path):
+        raise FileNotFoundError(f"Missing norm stats for sat {sat_id}: {norm_path}")
+    with open(norm_path, "r") as f:
+        ns = json.load(f)
+    x_mean = np.array(ns["x_mean"], dtype=np.float32)
+    x_std  = np.array(ns["x_std"],  dtype=np.float32)
+    y_mean = np.array(ns["y_mean"], dtype=np.float32)
+    y_std  = np.array(ns["y_std"],  dtype=np.float32)
+
+    def nx(A): return (A - x_mean[None,:]) / x_std[None,:]
+    def dy(A): return A * y_std[None,:] + y_mean[None,:]
+
+    # Load model weights
+    model_path = os.path.join(MODELDIR, f"lstm_sat{sat_id}.pth")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Missing model for sat {sat_id}: {model_path}")
+    model = LSTMReg(input_dim=X.shape[1]).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    # Predict on TEST set
+    with torch.no_grad():
+        X_te_n = nx(X_te)
+        Yp_te_n = model(torch.tensor(X_te_n[:,None,:], dtype=torch.float32, device=device)).cpu().numpy()
+    Yp_te = dy(Yp_te_n)  # denorm to km
+    Y_te_km = Y_te.copy()
+
+    # Pack into (N_rows, T=15, 3) tensors by base-sequence bucket
+    # Sort test rows by (horizon_int, horizon_frac) to build sequences; start new row when horizon wraps
+    order = np.argsort(np.stack([Hi_te, Hf_te], axis=1), axis=0)[:,0]
+    Hi_te_s = Hi_te[order]
+    Hf_te_s = Hf_te[order]
+    Yt_s    = Y_te_km[order]
+    Yp_s    = Yp_te[order]
+
+    buckets = defaultdict(list)
+    current, last_h = 0, None
+    for h_i, h_f, yt, yp in zip(Hi_te_s, Hf_te_s, Yt_s, Yp_s):
+        if last_h is not None and h_i < last_h:
+            current += 1
+        buckets[current].append((h_i, h_f, yt, yp))
+        last_h = h_i
+
+    Nrows = len(buckets)
+    Y_true = np.full((Nrows, T, 3), np.nan, dtype=np.float32)
+    Y_pred = np.full((Nrows, T, 3), np.nan, dtype=np.float32)
+    H_intM = np.full((Nrows, T),   -1,     dtype=np.int32)
+    H_frac = np.full((Nrows, T),    np.nan, dtype=np.float32)
+
+    for row_i, (_, triples) in enumerate(sorted(buckets.items())):
+        for (h_i, h_f, yt, yp) in triples:
+            if 0 <= h_i < T:
+                Y_true[row_i, h_i, :] = yt
+                Y_pred[row_i, h_i, :] = yp
+                H_intM[row_i, h_i]    = h_i
+                H_frac[row_i, h_i]    = h_f
+
+    Y_res = Y_true - Y_pred
+
+    # Save artifacts exactly as your aggregator expects
+    sat_dir = os.path.join(ARTDIR, f"sat_{sat_id}")
+    os.makedirs(sat_dir, exist_ok=True)
+    np.save(os.path.join(sat_dir, "Y_true_km.npy"), Y_true)
+    np.save(os.path.join(sat_dir, "Y_pred_km.npy"), Y_pred)
+    np.save(os.path.join(sat_dir, "residual_km.npy"), Y_res)
+    np.save(os.path.join(sat_dir, "H_test_days.npy"), H_intM)
+    np.save(os.path.join(sat_dir, "H_frac_days.npy"), H_frac)
+
+
+    # Use all finite cells across horizons; per-axis baseline = RMSE of Y_true; model = RMSE of residuals
+    maskR = np.isfinite(H_frac) & np.isfinite(Y_true[...,0])
+    maskA = np.isfinite(H_frac) & np.isfinite(Y_true[...,1])
+    maskC = np.isfinite(H_frac) & np.isfinite(Y_true[...,2])
+
+    base_R = rmse(Y_true[...,0][maskR]); res_R = rmse(Y_res[...,0][maskR])
+    base_A = rmse(Y_true[...,1][maskA]); res_A = rmse(Y_res[...,1][maskA])
+    base_C = rmse(Y_true[...,2][maskC]); res_C = rmse(Y_res[...,2][maskC])
+
+    # 3D RMS over valid cells (flatten rows*horizons)
+    base_3 = float(np.sqrt(np.mean(np.sum(Y_true[maskR|maskA|maskC]**2, axis=1))))
+    res_3  = float(np.sqrt(np.mean(np.sum(Y_res [maskR|maskA|maskC]**2, axis=1))))
+
+    #  By-horizon metrics (for the tables)
+    by_h = {}
+    by_h_PM = {}
+    for d in range(T):
+        m = (H_intM == d) & np.isfinite(Y_true[...,0])
+        if not np.any(m):
+            continue
+        yt_d = Y_true[m]     # (K,3)
+        yr_d = Y_res[m]
+        # per-axis RMSE
+        mse_d = np.mean((yr_d)**2, axis=0)
+        rmse_d = np.sqrt(mse_d)  # (3,)
+        # baseline per-axis (yt_d vs 0)
+        mse_b = np.mean((yt_d)**2, axis=0)
+        rmse_b = np.sqrt(mse_b)
+        # 3D RMS
+        rms3d_d = float(np.sqrt(np.mean(np.sum(yr_d**2, axis=1))))
+        rms3d_b = float(np.sqrt(np.mean(np.sum(yt_d**2, axis=1))))
+
+        by_h[d] = {
+            "RMSE_R": float(rmse_d[0]), "RMSE_A": float(rmse_d[1]), "RMSE_C": float(rmse_d[2]),
+            "RMS_3D": float(rms3d_d)
+        }
+        by_h_PM[d] = {
+            "PM_RMSE_R": pm_pair(float(rmse_b[0]), float(rmse_d[0])),
+            "PM_RMSE_A": pm_pair(float(rmse_b[1]), float(rmse_d[1])),
+            "PM_RMSE_C": pm_pair(float(rmse_b[2]), float(rmse_d[2])),
+            "PM_RMS_3D": pm_pair(float(rms3d_b),   float(rms3d_d)),
+        }
+
+    report = {
+        "satellite": int(sat_id),
+        "notes": {"target":"RSW km","horizons":"0..14 days","fractional_dt":"H_frac_days.npy"},
+        "test_overall_baseline": {"RMSE_R":base_R,"RMSE_A":base_A,"RMSE_C":base_C,"RMS_3D":base_3},
+        "test_overall":          {"RMSE_R":res_R, "RMSE_A":res_A, "RMSE_C":res_C, "RMS_3D":res_3},
+        "test_overall_PM_vs_baseline_percent": {
+            "PM_RMSE_R": pm_pair(base_R,res_R),
+            "PM_RMSE_A": pm_pair(base_A,res_A),
+            "PM_RMSE_C": pm_pair(base_C,res_C),
+            "PM_RMS_3D": pm_pair(base_3,res_3)
+        },
+        "test_by_horizon": by_h,
+        "test_by_horizon_PM_vs_baseline_percent": by_h_PM
+    }
+    with open(os.path.join(sat_dir, f"sat{sat_id}_model_test_report.json"), "w") as f:
+        json.dump(report, f, indent=2)
+
+    print(f"[sat {sat_id}] PM overall: R={report['test_overall_PM_vs_baseline_percent']['PM_RMSE_R']:.1f}% "
+          f"A={report['test_overall_PM_vs_baseline_percent']['PM_RMSE_A']:.1f}% "
+          f"C={report['test_overall_PM_vs_baseline_percent']['PM_RMSE_C']:.1f}% "
+          f"3D={report['test_overall_PM_vs_baseline_percent']['PM_RMS_3D']:.1f}%")
+
+# run per satellite
+for sat_id, items in sorted(by_sat.items()):
+    eval_one_sat(sat_id, items)
+
+
+
+
+
+ARTDIR = "outputs/artifacts"
+START_DAY = 1   # set 0 if you also want day 0
+END_DAY   = 14  # inclusive
+
+def fmt(x):
+    return "nan" if x is None else f"{x:.2f}%"
+
+sat_dirs = sorted(glob.glob(os.path.join(ARTDIR, "sat_*")))
+if not sat_dirs:
+    print("No satellite artifact directories found in", ARTDIR)
+    raise SystemExit(1)
+
+for sd in sat_dirs:
+    rpt_paths = glob.glob(os.path.join(sd, "sat*_model_test_report.json"))
+    if not rpt_paths:
+        # skip if report missing
+        continue
+    with open(rpt_paths[0], "r") as f:
+        rep = json.load(f)
+
+    sat_id = rep.get("satellite", os.path.basename(sd).split("_",1)[-1])
+    per_h  = rep.get("test_by_horizon_PM_vs_baseline_percent", {})
+    # normalize keys to int
+    per_h_int = {}
+    for k, v in per_h.items():
+        try:
+            per_h_int[int(k)] = v
+        except:
+            pass
+
+    print(f"\nSatellite {sat_id} — PM by day")
+    print("Day  PM_R   PM_A   PM_C   PM_3D")
+    for d in range(START_DAY, END_DAY+1):
+        pm = per_h_int.get(d)
+        if not pm:
+            continue
+        print(f"{d:3d}  {fmt(pm.get('PM_RMSE_R')):>6}  {fmt(pm.get('PM_RMSE_A')):>6}  "
+              f"{fmt(pm.get('PM_RMSE_C')):>6}  {fmt(pm.get('PM_RMS_3D')):>6}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
